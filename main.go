@@ -39,6 +39,10 @@ func main() {
 	}
 	defer problemLog.close()
 
+	if _, err := os.Stat(outPath); err == nil {
+		log.Fatalf("output file already exists: %s\n  delete or rename it before running again.", outPath)
+	}
+
 	files, err := findXlsxFiles(baseDir, outPath)
 	if err != nil {
 		log.Fatal(err)
@@ -238,65 +242,70 @@ func appendXlsxToCSV(dst *os.File, srcPath string, headerWritten *bool, pl *prob
 	}
 	defer src.Close()
 
-	// Use the first sheet rather than assuming the name is always "Sheet1".
 	sheets := src.GetSheetList()
 	if len(sheets) == 0 {
 		return 0, fmt.Errorf("no sheets found")
 	}
-	sheetName := sheets[0]
-
-	rows, err := src.Rows(sheetName)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
 
 	written := 0
-	rowNum := 0
-	isHeaderRow := true
 	fileName := filepath.Base(srcPath)
 
-	for rows.Next() {
-		rowNum++
-		cols, err := rows.Columns()
+	for _, sheetName := range sheets {
+		rows, err := src.Rows(sheetName)
 		if err != nil {
-			pl.record(fileName, sheetName, rowNum, err.Error(), cols)
+			pl.record(fileName, sheetName, 0, "open sheet: "+err.Error(), nil)
 			continue
 		}
-		if isHeaderRow {
-			isHeaderRow = false
-			if !*headerWritten {
-				if err := writeRow(dst, cols); err != nil {
-					return written, fmt.Errorf("write header: %w", err)
-				}
-				*headerWritten = true
+
+		rowNum := 0
+		isHeaderRow := true
+
+		for rows.Next() {
+			rowNum++
+			cols, err := rows.Columns()
+			if err != nil {
+				pl.record(fileName, sheetName, rowNum, err.Error(), cols)
+				continue
 			}
-			continue
+			if isHeaderRow {
+				isHeaderRow = false
+				if !*headerWritten {
+					if err := writeRow(dst, cols); err != nil {
+						rows.Close()
+						return written, fmt.Errorf("write header: %w", err)
+					}
+					*headerWritten = true
+				}
+				continue
+			}
+			if len(cols) == 0 {
+				continue // skip blank rows silently
+			}
+			if err := writeRow(dst, cols); err != nil {
+				rows.Close()
+				return written, fmt.Errorf("write row %d: %w", rowNum, err)
+			}
+			written++
 		}
-		if len(cols) == 0 {
-			continue // skip blank rows silently
+		if err := rows.Error(); err != nil {
+			pl.record(fileName, sheetName, rowNum, "row iterator: "+err.Error(), nil)
 		}
-		if err := writeRow(dst, cols); err != nil {
-			return written, fmt.Errorf("write row %d: %w", rowNum, err)
-		}
-		written++
-	}
-	if err := rows.Error(); err != nil {
-		pl.record(fileName, sheetName, rowNum, "row iterator: "+err.Error(), nil)
+		rows.Close()
 	}
 	return written, nil
 }
 
-// writeRow writes a tab-separated row followed by newline.
+// writeRow writes a comma-separated row followed by newline.
+// Fields containing commas, double-quotes, or newlines are quoted per RFC 4180.
 func writeRow(f *os.File, cols []string) error {
 	for i, v := range cols {
-		v = strings.ReplaceAll(v, "\t", " ")
-		v = strings.ReplaceAll(v, "\n", " ")
-		v = strings.ReplaceAll(v, "\r", " ")
 		if i > 0 {
-			if _, err := f.WriteString("\t"); err != nil {
+			if _, err := f.WriteString(","); err != nil {
 				return err
 			}
+		}
+		if strings.ContainsAny(v, ",\"\n\r") {
+			v = `"` + strings.ReplaceAll(v, `"`, `""`) + `"`
 		}
 		if _, err := f.WriteString(v); err != nil {
 			return err
